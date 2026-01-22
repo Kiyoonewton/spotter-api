@@ -7,9 +7,9 @@ import math
 import random
 from typing import Dict, List, Tuple, Any, Optional, Union
 
-# Import route calculator
-from eld_modules.route_calculator import interpolate_position
-from eld_modules.location_name import get_location_name
+# Import domain services
+from domain.route.services import interpolate_position
+from domain.location.services import get_location_name
 
 # Type definitions
 Location = Dict[str, float]  # {"lat": float, "lng": float}

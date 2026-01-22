@@ -8,10 +8,10 @@ from rest_framework import status
 import datetime
 import json
 
-# Import ELD modules for processing
-from eld_modules.route_calculator import calculate_multi_stop_route
-from eld_modules.stop_generator import generate_stops
-from eld_modules.eld_log_generator import generate_eld_logs, create_eld_data
+# Import domain services
+from domain.route.services import calculate_multi_stop_route
+from domain.stop.services import generate_stops
+from domain.eld_log.services import generate_eld_logs, create_eld_data
 
 class TripELDView(APIView):
     """

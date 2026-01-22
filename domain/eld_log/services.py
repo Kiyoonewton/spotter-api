@@ -8,8 +8,8 @@ import random
 import json
 from typing import Dict, List, Tuple, Any, Optional, Union
 
-# Import from other modules
-from eld_modules.location_name import get_location_name
+# Import domain services
+from domain.location.services import get_location_name
 
 # Type definitions
 Location = Dict[str, float]  # {"lat": float, "lng": float}

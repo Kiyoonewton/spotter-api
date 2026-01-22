@@ -31,3 +31,7 @@ media/
 # Ignore VS Code and JetBrains IDE files (optional)
 .vscode/
 .idea/
+
+# Ignore location cache
+domain/location/cache/
+location_cache/
