@@ -1,0 +1,18 @@
+eld_api/
+├── manage.py
+├── eld_api/
+│   ├── __init__.py
+│   ├── settings.py
+│   ├── urls.py
+│   ├── wsgi.py
+│   └── asgi.py
+├── trip/
+│   ├── __init__.py
+│   ├── views.py
+│   └── urls.py
+└── eld_modules/
+    ├── __init__.py
+    ├── route_calculator.py
+    ├── stop_generator.py
+    ├── location_name.py
+    └── eld_log_generator.py
