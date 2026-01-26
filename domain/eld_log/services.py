@@ -33,14 +33,62 @@ def format_coordinates(coordinates: List[float]) -> str:
     """Format coordinates to a readable string"""
     return f"{coordinates[1]:.4f}, {coordinates[0]:.4f}"
 
-def generate_eld_logs(stops: List, starting_odometer: int = None) -> List[DailyLogSheet]:
+def calculate_recap_data(daily_logs: List[Dict[str, Any]], current_day_index: int) -> Dict[str, Any]:
+    """
+    Calculate recap data for HOS compliance tracking
+
+    Args:
+        daily_logs: List of all daily log sheets
+        current_day_index: Index of the current day (0-based)
+
+    Returns:
+        Dictionary with recap calculations for both 70-hour/8-day and 60-hour/7-day rules
+    """
+    # Get total on-duty hours for current day
+    on_duty_hours_today = daily_logs[current_day_index].get("totalHours", 0)
+
+    # Calculate hours for different lookback periods
+    def sum_hours_for_period(days_back: int) -> float:
+        """Sum on-duty hours for the last N days including today"""
+        total_hours = 0
+        start_index = max(0, current_day_index - days_back + 1)
+        for i in range(start_index, current_day_index + 1):
+            total_hours += daily_logs[i].get("totalHours", 0)
+        return round(total_hours, 2)
+
+    # 70-Hour/8-Day Rule calculations
+    hours_last_7_days = sum_hours_for_period(7)  # Last 7 days including today
+    hours_last_5_days = sum_hours_for_period(5)  # Last 5 days including today
+    hours_available_70 = max(0, round(70 - hours_last_7_days, 2))
+
+    # 60-Hour/7-Day Rule calculations
+    hours_last_8_days = sum_hours_for_period(8)  # Last 8 days including today
+    hours_last_7_days_60 = sum_hours_for_period(7)  # Last 7 days including today (for 60-hour rule)
+    hours_available_60 = max(0, round(60 - hours_last_8_days, 2))
+
+    return {
+        "onDutyHoursToday": round(on_duty_hours_today, 2),
+        "rule70Hour8Day": {
+            "hoursLast7Days": hours_last_7_days,  # A: Total hours on duty last 7 days
+            "hoursAvailableTomorrow": hours_available_70,  # B: 70 - A
+            "hoursLast5Days": hours_last_5_days  # C: Total hours on duty last 5 days
+        },
+        "rule60Hour7Day": {
+            "hoursLast8Days": hours_last_8_days,  # A: Total hours on duty last 8 days
+            "hoursAvailableTomorrow": hours_available_60,  # B: 60 - A
+            "hoursLast7Days": hours_last_7_days_60  # C: Total hours on duty last 7 days
+        }
+    }
+
+def generate_eld_logs(stops: List, starting_odometer: int = None, total_route_distance: float = None) -> List[DailyLogSheet]:
     """
     Generate ELD logs from a list of stops
-    
+
     Args:
         stops: List of stops with type, coordinates, estimatedArrival
         starting_odometer: Starting odometer reading (defaults to random value)
-        
+        total_route_distance: Total distance of the route in miles (for accurate distribution)
+
     Returns:
         List of daily log sheets
     """
@@ -63,27 +111,79 @@ def generate_eld_logs(stops: List, starting_odometer: int = None) -> List[DailyL
             
         stops_by_day[day].append(stop)
     
+    # Calculate total driving hours across all days for proportional distance distribution
+    total_driving_hours = 0
+    daily_driving_hours_list = []
+
+    if total_route_distance:
+        # First pass: calculate driving hours for each day
+        for day, day_stops in sorted(stops_by_day.items()):
+            day_driving_hours = 0
+
+            for i in range(len(day_stops) - 1):
+                stop = day_stops[i]
+                next_stop = day_stops[i + 1]
+
+                # Skip overnight and off-duty stops
+                if next_stop["type"] in ["off-duty", "overnight"] or stop["type"] in ["off-duty", "overnight"]:
+                    continue
+
+                stop_time = datetime.datetime.fromisoformat(stop["estimatedArrival"])
+                next_time = datetime.datetime.fromisoformat(next_stop["estimatedArrival"])
+
+                # Determine stop duration based on type
+                stop_duration = 0.5  # Default 30 minutes
+                if stop["type"] == "pickup":
+                    stop_duration = 1.0
+                elif stop["type"] == "dropoff":
+                    stop_duration = 1.0
+                elif stop["type"] == "fuel":
+                    stop_duration = 0.5
+                elif stop["type"] == "waypoint":
+                    stop_duration = 0.5
+
+                driving_start = stop_time + datetime.timedelta(minutes=int(stop_duration * 60))
+                time_diff = (next_time - driving_start).total_seconds() / 3600
+
+                # Cap at 11 hours max driving per day
+                remaining_hours = max(0, 11.0 - day_driving_hours)
+                time_diff = min(time_diff, remaining_hours, 11.0)
+
+                if time_diff > 0.25:  # More than 15 minutes
+                    day_driving_hours += time_diff
+
+            daily_driving_hours_list.append(day_driving_hours)
+            total_driving_hours += day_driving_hours
+
+        # Avoid division by zero
+        if total_driving_hours == 0:
+            total_driving_hours = 1
+
     # Initialize daily logs
     daily_logs = []
     current_odometer = starting_odometer
     current_position = 0  # Track miles driven
-    
+    cumulative_miles = 0  # Track cumulative mileage across all days
+
     # Process each day
     for day_index, (day, day_stops) in enumerate(sorted(stops_by_day.items())):
         # Create daily log sheet
         daily_log = create_daily_log_sheet(day)
-        
+
         # Set start location from first stop of the day
         first_stop = day_stops[0]
         first_stop_time = datetime.datetime.fromisoformat(first_stop["estimatedArrival"])
         daily_log["startTime"] = first_stop_time.isoformat()
         daily_log["startLocation"] = get_location_name(first_stop["coordinates"])
         daily_log["startOdometer"] = current_odometer
-        
+
         # Track hours for HOS compliance
         driving_hours = 0
         on_duty_hours = 0
-        
+
+        # Track daily mileage from stops
+        daily_miles = 0
+
         # Generate duty status changes and remarks
         duty_statuses = []
         remarks = []
@@ -98,11 +198,19 @@ def generate_eld_logs(stops: List, starting_odometer: int = None) -> List[DailyL
         is_early_completion = is_last_day and last_stop_hour < DRIVING_END_HOUR and day_stops[-1]["type"] == "dropoff"
         
         # Process stops to extract initial duty statuses from the generated stops
+        # NOTE: Removed the old mileage calculation from distanceFromPrevious
+        # This was causing unrealistic daily mileage calculations (1000+ miles/day)
+        # Mileage is now calculated accurately from actual driving time later in the code
+
         for stop in day_stops:
             stop_time = datetime.datetime.fromisoformat(stop["estimatedArrival"])
             stop_hour = stop_time.hour + (stop_time.minute / 60)
             stop_type = stop["type"]
-            
+
+            # REMOVED: This was adding incorrect mileage
+            # if "distanceFromPrevious" in stop:
+            #     daily_miles += stop["distanceFromPrevious"]
+
             # Map stop types to duty statuses
             if stop_type == "overnight":
                 add_duty_status(duty_statuses, stop_hour, "sleeper-berth")
@@ -188,32 +296,37 @@ def generate_eld_logs(stops: List, starting_odometer: int = None) -> List[DailyL
         for i, stop in enumerate(day_stops):
             stop_time = datetime.datetime.fromisoformat(stop["estimatedArrival"])
             stop_hour = stop_time.hour + (stop_time.minute / 60)
+
             
             # Determine duty status based on stop type
+            # Get location name for all stops
+            stop_location = get_location_name(stop["coordinates"])
+
             if stop["type"] == "start":
                 next_status = "on-duty"
-                add_remark(remarks, stop_hour, "Starting Location")
+                add_remark(remarks, stop_hour, stop_location)
             elif stop["type"] == "pretrip":
                 next_status = "on-duty"
-                add_remark(remarks, stop_hour, "Pre-trip Inspection")
+                add_remark(remarks, stop_hour, stop_location)
             elif stop["type"] == "rest":
                 next_status = "off-duty"
-                add_remark(remarks, stop_hour, "30-Minute Break")
+                add_remark(remarks, stop_hour, stop_location)
             elif stop["type"] == "fuel":
                 next_status = "on-duty"
-                add_remark(remarks, stop_hour, "Fueling")
+                add_remark(remarks, stop_hour, stop_location)
             elif stop["type"] == "off-duty":
                 next_status = "off-duty"
-                add_remark(remarks, stop_hour, "End of Driving Day")
+                add_remark(remarks, stop_hour, stop_location)
             elif stop["type"] == "overnight":
                 next_status = "sleeper-berth"
-                add_remark(remarks, stop_hour, "10-Hour Rest")
+                add_remark(remarks, stop_hour, stop_location)
             elif stop["type"] in ["pickup", "dropoff", "waypoint"]:
                 next_status = "on-duty"
-                add_remark(remarks, stop_hour, stop["name"])
+                add_remark(remarks, stop_hour, stop_location)
             else:
                 # Default for unknown stop types
                 next_status = "on-duty"
+                add_remark(remarks, stop_hour, stop_location)
             
             # Only add status change if it's different from current status
             if next_status != current_status:
@@ -227,27 +340,44 @@ def generate_eld_logs(stops: List, starting_odometer: int = None) -> List[DailyL
                 
                 # Check if there's driving between stops
                 if next_stop["type"] not in ["off-duty", "overnight"] and stop["type"] not in ["off-duty", "overnight"]:
-                    # Assume driving between stops
+                    # Determine stop duration based on type
                     stop_duration = 0.5  # Default 30 minutes
+                    if stop["type"] == "pickup":
+                        stop_duration = 1.0  # 1 hour for pickup
+                    elif stop["type"] == "dropoff":
+                        stop_duration = 1.0  # 1 hour for dropoff
+                    elif stop["type"] == "fuel":
+                        stop_duration = 0.5  # 30 minutes for fuel
+                    elif stop["type"] == "waypoint":
+                        stop_duration = 0.5  # 30 minutes for waypoint
+
                     driving_start = stop_time + datetime.timedelta(minutes=int(stop_duration * 60))
                     driving_start_hour = driving_start.hour + (driving_start.minute / 60)
                     
                     # Only add driving status if there's enough time between stops
                     time_diff = (next_time - driving_start).total_seconds() / 3600
-                    
+
+                    # Cap driving time at maximum daily driving limit
+                    # This prevents unrealistic mileage calculations when stops span long periods
+                    max_driving_remaining = MAX_DRIVING_HOURS - driving_hours
+                    time_diff = min(time_diff, max_driving_remaining, 11.0)  # Never exceed 11 hours
+
                     if time_diff > 0.25:  # More than 15 minutes driving
                         if current_status != "driving":
                             add_duty_status(duty_statuses, driving_start_hour, "driving")
                             current_status = "driving"
-                        
-                        # Estimate miles driven based on time (60 mph average)
-                        miles_driven = time_diff * 60
-                        current_odometer += round(miles_driven)
-                        current_position += miles_driven
-                        
+
                         # Track hours for HOS
                         driving_hours += time_diff
                         on_duty_hours += time_diff
+
+        # After processing all stops, calculate daily mileage
+        # Use time-based calculation (60 mph average)
+        daily_miles = driving_hours * 60
+
+        # Cap at realistic daily maximum based on HOS regulations
+        # Max 11 hours driving at 60 mph = 660 miles, but typically 480-550 miles
+        daily_miles = min(daily_miles, 660)
         
         # Ensure standard end-of-day pattern (off-duty at 17:30, sleeper-berth at 19:00)
         # unless it's the last day with early completion
@@ -273,14 +403,16 @@ def generate_eld_logs(stops: List, starting_odometer: int = None) -> List[DailyL
         last_stop_time = datetime.datetime.fromisoformat(last_stop["estimatedArrival"])
         daily_log["endTime"] = last_stop_time.isoformat()
         daily_log["endLocation"] = get_location_name(last_stop["coordinates"])
+
+        # Update cumulative miles and odometer
+        cumulative_miles += daily_miles
+        current_odometer += round(daily_miles)
         daily_log["endOdometer"] = current_odometer
-        
+
         # Calculate total miles for the day
-        daily_log["totalMiles"] = round(current_position)
-        
-        # Reset current position for next day
-        current_position = 0
-        
+        daily_log["totalMiles"] = round(daily_miles)
+        daily_log["cumulativeMiles"] = round(cumulative_miles)
+
         # Sort duty statuses and remarks by hour
         duty_statuses.sort(key=lambda x: x["hour"])
         remarks.sort(key=lambda x: x["time"])
@@ -306,10 +438,30 @@ def generate_eld_logs(stops: List, starting_odometer: int = None) -> List[DailyL
                 "type": "on-duty-limit",
                 "description": f"Exceeded {MAX_ON_DUTY_HOURS}-hour on-duty limit ({on_duty_hours:.1f} hours)"
             })
-        
-        # Add total hours
-        daily_log["totalHours"] = on_duty_hours
-        
+
+        # Calculate total on-duty hours from duty status graph
+        total_on_duty_hours = 0
+        sorted_statuses = sorted(duty_statuses, key=lambda x: x["hour"])
+
+        for i in range(len(sorted_statuses) - 1):
+            current_status = sorted_statuses[i]["status"]
+            if current_status in ["driving", "on-duty"]:
+                next_hour = sorted_statuses[i + 1]["hour"]
+                current_hour = sorted_statuses[i]["hour"]
+                segment_hours = next_hour - current_hour
+                total_on_duty_hours += segment_hours
+
+        # Handle last segment
+        if sorted_statuses and sorted_statuses[-1]["status"] in ["driving", "on-duty"]:
+            # Extend to end of day or last stop time
+            last_stop_hour = last_stop_time.hour + (last_stop_time.minute / 60)
+            # Only add hours until the last stop or end of standard driving day
+            remaining_hours = min(24, last_stop_hour) - sorted_statuses[-1]["hour"]
+            if remaining_hours > 0:
+                total_on_duty_hours += remaining_hours
+
+        daily_log["totalHours"] = round(total_on_duty_hours, 2)
+
         # Add to list of daily logs
         daily_logs.append(daily_log)
     
@@ -323,8 +475,58 @@ def generate_eld_logs(stops: List, starting_odometer: int = None) -> List[DailyL
         
         # Add driving stats
         log["totalMilesDrivingToday"] = f"{log['totalMiles']} miles"
-        log["totalMileageToday"] = f"{log['totalMiles']} miles"
-    
+        log["totalMileageToday"] = f"{log['cumulativeMiles']} miles"
+
+    # Add cycle hours information if available from stops
+    if stops and len(stops) > 0 and "cycleHoursUsed" in stops[0]:
+        for log in daily_logs:
+            log["cycleHoursUsed"] = stops[0]["cycleHoursUsed"]
+            log["cycleHoursRemaining"] = stops[0]["cycleHoursRemaining"]
+            log["cycleHoursAvailable"] = stops[0]["cycleHoursAvailable"]
+            if "cycleWarning" in stops[0]:
+                log["cycleWarning"] = stops[0]["cycleWarning"]
+
+    # Post-process: Adjust mileage distribution if total route distance is provided
+    if total_route_distance:
+        # Calculate total miles accumulated across all days
+        total_accumulated_miles = sum(log["totalMiles"] for log in daily_logs)
+
+        # If there's a significant discrepancy, redistribute proportionally
+        if abs(total_accumulated_miles - total_route_distance) > 10:  # More than 10 miles difference
+            # Calculate total on-duty hours across all days (from graph data)
+            total_on_duty_hours = sum(log.get("totalHours", 0) for log in daily_logs)
+
+            if total_on_duty_hours > 0:
+                # Redistribute mileage proportionally based on on-duty hours
+                current_odometer = daily_logs[0]["startOdometer"]
+                cumulative_miles = 0
+
+                for log in daily_logs:
+                    day_hours = log.get("totalHours", 0)
+                    if day_hours > 0:
+                        # Proportional share of total distance
+                        proportional_miles = (day_hours / total_on_duty_hours) * total_route_distance
+                        # Cap at 660 miles per day (11 hours × 60 mph)
+                        daily_miles = min(proportional_miles, 660)
+                    else:
+                        daily_miles = 0
+
+                    # Update mileage fields
+                    log["totalMiles"] = round(daily_miles)
+                    cumulative_miles += daily_miles
+                    log["cumulativeMiles"] = round(cumulative_miles)
+                    log["totalMilesDrivingToday"] = f"{round(daily_miles)} miles"
+                    log["totalMileageToday"] = f"{round(cumulative_miles)} miles"
+
+                    # Update odometer
+                    current_odometer += round(daily_miles)
+                    log["endOdometer"] = current_odometer
+
+    # Calculate recap data for each day
+    for day_index, log in enumerate(daily_logs):
+        recap = calculate_recap_data(daily_logs, day_index)
+        log["recap"] = recap
+
     return daily_logs
 
 def create_daily_log_sheet(date_str: str) -> DailyLogSheet:
@@ -436,6 +638,8 @@ def generate_log_entries(
     day_end = datetime.datetime.fromisoformat(end_time_str)
     day_date = day_start.date().isoformat()
     
+    total_on_duty_hours = 0
+    
     # Sort duty statuses by hour
     sorted_statuses = sorted(duty_statuses, key=lambda x: x["hour"])
     
@@ -519,8 +723,8 @@ def create_eld_data(route, stops, starting_odometer=None):
     Returns:
         Complete ELD data structure
     """
-    # Generate daily logs
-    eld_logs = generate_eld_logs(stops, starting_odometer)
+    # Generate daily logs with total route distance for accurate mileage distribution
+    eld_logs = generate_eld_logs(stops, starting_odometer, route["distance"])
     
     # Create the final data structure
     eld_data = {

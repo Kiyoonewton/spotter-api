@@ -22,14 +22,18 @@ DRIVING_START_HOUR = 7.0   # 7:00 AM
 DRIVING_END_HOUR = 17.5    # 5:30 PM
 SLEEPER_START_HOUR = 19.0  # 7:00 PM
 SLEEPER_END_HOUR = 6.5     # 6:30 AM
-FUEL_STOP_INTERVAL = 500   # Miles between fuel stops
-PICKUP_DURATION = 0.5      # 30 minutes for pickup
-DROPOFF_DURATION = 0.5     # 30 minutes for dropoff
+FUEL_STOP_INTERVAL = 1000  # Miles between fuel stops
+PICKUP_DURATION = 1.0      # 1 hour for pickup
+DROPOFF_DURATION = 1.0     # 1 hour for dropoff
 WAYPOINT_DURATION = 0.5    # 30 minutes for waypoints
 FUEL_DURATION = 0.5        # 30 minutes for fuel
 BREAK_DURATION = 0.5       # 30 minutes for break
 PREFERRED_BREAK_HOUR = 14.0  # 2:00 PM for breaks
 AVG_SPEED_MPH = 60         # Average driving speed in mph
+MAX_CYCLE_HOURS = 70       # Maximum hours in 8-day cycle
+CYCLE_DAYS = 8             # Number of days in cycle
+MAX_DAILY_DRIVING = 11     # Maximum driving hours per day
+MAX_DAILY_ON_DUTY = 14     # Maximum on-duty hours per day
 
 def format_duration(hours: float) -> str:
     """Format hours into a readable duration string"""
@@ -259,6 +263,12 @@ def generate_stops(
     hours_of_driving_since_last_break = current_cycle_used
     total_distance = route["distance"]
     days_on_road = 0
+
+    # Track cycle hours (70-hour/8-day rule)
+    # This tracks on-duty + driving hours across the entire trip
+    cycle_hours_used = current_cycle_used
+    daily_on_duty_hours = 0  # Track on-duty hours for current day
+    daily_driving_hours = 0  # Track driving hours for current day
     
     # Add starting point (always off-duty at the beginning)
     stops.append({
@@ -292,16 +302,20 @@ def generate_stops(
     current_hour = current_timestamp.hour + (current_timestamp.minute / 60)
     if current_hour >= PRE_TRIP_START_HOUR and current_hour < DRIVING_START_HOUR:
         # Add pre-trip inspection
+        pretrip_time = DRIVING_START_HOUR - current_hour
         stops.append({
             "type": "pretrip",
             "name": "Pre-trip Inspection",
             "coordinates": [locations[0]["lng"], locations[0]["lat"]],
-            "duration": format_duration(DRIVING_START_HOUR - PRE_TRIP_START_HOUR),
+            "duration": format_duration(pretrip_time),
             "estimatedArrival": current_timestamp.isoformat()
         })
-        
+
+        # Track pre-trip on-duty hours
+        daily_on_duty_hours += pretrip_time
+        cycle_hours_used += pretrip_time
+
         # Update time
-        pretrip_time = DRIVING_START_HOUR - current_hour
         current_timestamp += datetime.timedelta(hours=pretrip_time)
     
     # Ensure we start at or after driving start hour
@@ -364,7 +378,7 @@ def generate_stops(
                 
                 # Move to next morning
                 current_timestamp = current_timestamp + datetime.timedelta(hours=10)
-                
+
                 # Handle early morning for subsequent days
                 next_day_hour = current_timestamp.hour + (current_timestamp.minute / 60)
                 if next_day_hour < SLEEPER_END_HOUR:
@@ -376,16 +390,20 @@ def generate_stops(
                         "duration": format_duration(SLEEPER_END_HOUR - next_day_hour),
                         "estimatedArrival": current_timestamp.isoformat()
                     })
-                    
+
                     # Update to 6:30 AM
                     current_timestamp = current_timestamp.replace(
                         hour=int(SLEEPER_END_HOUR),
                         minute=int((SLEEPER_END_HOUR % 1) * 60),
                         second=0
                     )
-                
+
                 current_timestamp = next_driving_start_time(current_timestamp)
                 hours_of_driving_since_last_break = 0
+
+                # Reset daily hours for new day
+                daily_on_duty_hours = 0
+                daily_driving_hours = 0
                 days_on_road += 1
                 continue
             
@@ -410,9 +428,21 @@ def generate_stops(
                 current_timestamp = break_time + datetime.timedelta(hours=BREAK_DURATION)
                 continue
             
+            # Check daily limits
+            hours_until_daily_driving_limit = max(0, MAX_DAILY_DRIVING - daily_driving_hours)
+            hours_until_daily_on_duty_limit = max(0, MAX_DAILY_ON_DUTY - daily_on_duty_hours)
+            hours_until_cycle_limit = max(0, MAX_CYCLE_HOURS - cycle_hours_used)
+
             # Determine how far we can drive in remaining day
             hours_left_before_break = max(0, 8 - hours_of_driving_since_last_break)
-            drivable_hours = min(remaining_drive, hours_until_end, hours_left_before_break)
+            drivable_hours = min(
+                remaining_drive,
+                hours_until_end,
+                hours_left_before_break,
+                hours_until_daily_driving_limit,
+                hours_until_daily_on_duty_limit,
+                hours_until_cycle_limit
+            )
             
             # If we can't drive (need a break), skip to the next iteration
             if drivable_hours <= 0:
@@ -466,6 +496,11 @@ def generate_stops(
                 hours_of_driving_since_last_break += driving_hours_to_fuel
                 miles_to_next_fuel = FUEL_STOP_INTERVAL
                 remaining_drive -= driving_hours_to_fuel
+
+                # Track cycle hours (driving + fuel stop on-duty time)
+                daily_driving_hours += driving_hours_to_fuel
+                daily_on_duty_hours += driving_hours_to_fuel + FUEL_DURATION
+                cycle_hours_used += driving_hours_to_fuel + FUEL_DURATION
                 
                 # Check if we need a break after fueling
                 if hours_of_driving_since_last_break >= 7:
@@ -530,13 +565,18 @@ def generate_stops(
             # Drive as far as we can in this segment
             drive_position = segment_position + (drivable_hours * AVG_SPEED_MPH)
             arrival_time = calculate_time_restricted_arrival(current_timestamp, drivable_hours)
-            
+
             # Update position and time
             segment_position = drive_position
             current_timestamp = arrival_time
             remaining_drive -= drivable_hours
             miles_to_next_fuel -= drivable_hours * AVG_SPEED_MPH
             hours_of_driving_since_last_break += drivable_hours
+
+            # Track cycle hours (driving counts as on-duty)
+            daily_driving_hours += drivable_hours
+            daily_on_duty_hours += drivable_hours
+            cycle_hours_used += drivable_hours
             
             # If we're at end of day, add overnight stop
             hours_until_end = calculate_hours_until_end_of_driving_day(current_timestamp)
@@ -579,7 +619,7 @@ def generate_stops(
                 
                 # Move to next morning
                 current_timestamp = sleeper_time + datetime.timedelta(hours=10)
-                
+
                 # Handle early morning for subsequent days
                 next_day_hour = current_timestamp.hour + (current_timestamp.minute / 60)
                 if next_day_hour < SLEEPER_END_HOUR:
@@ -591,16 +631,20 @@ def generate_stops(
                         "duration": format_duration(SLEEPER_END_HOUR - next_day_hour),
                         "estimatedArrival": current_timestamp.isoformat()
                     })
-                    
+
                     # Update to 6:30 AM
                     current_timestamp = current_timestamp.replace(
                         hour=int(SLEEPER_END_HOUR),
                         minute=int((SLEEPER_END_HOUR % 1) * 60),
                         second=0
                     )
-                
+
                 current_timestamp = next_driving_start_time(current_timestamp)
                 hours_of_driving_since_last_break = 0
+
+                # Reset daily hours for new day
+                daily_on_duty_hours = 0
+                daily_driving_hours = 0
                 days_on_road += 1
         
         # We've completed driving to this location
@@ -630,13 +674,30 @@ def generate_stops(
             "name": location_name,
             "coordinates": [locations[i]["lng"], locations[i]["lat"]],
             "duration": format_duration(stop_duration),
-            "estimatedArrival": current_timestamp.isoformat()
+            "estimatedArrival": current_timestamp.isoformat(),
+            "distanceFromPrevious": distance_to_next  # ADD THIS
         })
-        
+
+        # Track cycle hours for pickup/dropoff/waypoint (on-duty time)
+        daily_on_duty_hours += stop_duration
+        cycle_hours_used += stop_duration
+
         # Update time after stop
         current_timestamp += datetime.timedelta(hours=stop_duration)
     
     # Sort stops by arrival time
     stops.sort(key=lambda s: s["estimatedArrival"])
-    
+
+    # Add cycle hours metadata to the first stop (for reference)
+    if stops:
+        stops[0]["cycleHoursUsed"] = cycle_hours_used
+        stops[0]["cycleHoursRemaining"] = max(0, MAX_CYCLE_HOURS - cycle_hours_used)
+        stops[0]["cycleHoursAvailable"] = MAX_CYCLE_HOURS
+
+        # Add warning if approaching cycle limit
+        if cycle_hours_used >= MAX_CYCLE_HOURS * 0.9:  # 90% of limit
+            stops[0]["cycleWarning"] = f"Approaching 70-hour cycle limit ({cycle_hours_used:.1f} of {MAX_CYCLE_HOURS} hours used)"
+        elif cycle_hours_used > MAX_CYCLE_HOURS:
+            stops[0]["cycleWarning"] = f"EXCEEDED 70-hour cycle limit ({cycle_hours_used:.1f} of {MAX_CYCLE_HOURS} hours used)"
+
     return stops

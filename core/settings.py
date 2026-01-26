@@ -88,7 +88,15 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'core.wsgi.application'
 
-# No database config since we're not using a database
+# Database configuration
+# Using SQLite with in-memory database since we don't persist any data
+# This satisfies Django's requirement but data is never actually stored
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': ':memory:',
+    }
+}
 
 # Internationalization
 LANGUAGE_CODE = 'en-us'
