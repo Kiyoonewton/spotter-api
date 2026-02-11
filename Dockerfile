@@ -22,4 +22,4 @@ EXPOSE 8000
 
 # Run the application
 # Update the CMD line in Dockerfile
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--log-level=debug", "--capture-output", "--enable-stdio-inheritance", "eld_api.wsgi:application"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--log-level=debug", "--capture-output", "--enable-stdio-inheritance", "core.wsgi:application"]
